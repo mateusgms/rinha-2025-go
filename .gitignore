@@ -30,3 +30,28 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Build artifacts and logs
+main
+*.log
+build.log
+
+# Mock processors (for development only)
+mock-processor/
+
+# Test and development scripts
+cleanup-test.sh
+demo.sh
+setup-test.sh
+
+# Old configurations
+docker-compose-old.yml
+
+# Submission files (keep only main README.md)
+README-submission.md
+SUBMISSION.md
+TESTING.md
+info.json
+
+# Payment processor logs
+payment-processor-*.log
