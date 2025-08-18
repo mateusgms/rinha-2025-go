@@ -11,45 +11,39 @@ services:
       - "9999:9999"
     networks:
       - backend
+      - payment-processor
     deploy:
       resources:
         limits:
           cpus: "0.05"
           memory: "10MB"
   api1: &api
-    build: .
+    image: mateusgms/rinha-2025-go:latest
     hostname: rinha-api1
     environment:
       - APP_PORT=8080
-      - POSTGRES_URL=postgres://user:password@postgres:5432/dbname
-      - DEFAULT_PROCESSOR_URL=http://host.docker.internal:8001
-      - FALLBACK_PROCESSOR_URL=http://host.docker.internal:8002
-      - GOGC=100
-      - GOMAXPROCS=1
+      - POSTGRES_URL=postgres://user:password@postgres:5432/dbname?sslmode=disable
+      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
+      - FALLBACK_PROCESSOR_URL=http://payment-processor-fallback:8080
     networks:
       - backend
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - payment-processor
     depends_on:
       postgres:
         condition: service_healthy
     deploy:
       resources:
         limits:
-          cpus: "0.6"
-          memory: "120MB"
+          cpus: "0.45"
+          memory: "70MB"
   api2:
     <<: *api
     hostname: rinha-api2
     environment:
       - APP_PORT=8080
-      - POSTGRES_URL=postgres://user:password@postgres:5432/dbname
-      - DEFAULT_PROCESSOR_URL=http://host.docker.internal:8001
-      - FALLBACK_PROCESSOR_URL=http://host.docker.internal:8002
-      - GOGC=100
-      - GOMAXPROCS=1
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - POSTGRES_URL=postgres://user:password@postgres:5432/dbname?sslmode=disable
+      - DEFAULT_PROCESSOR_URL=http://payment-processor-default:8080
+      - FALLBACK_PROCESSOR_URL=http://payment-processor-fallback:8080
 
   postgres:
     image: postgres:16-alpine
@@ -58,7 +52,7 @@ services:
       - POSTGRES_PASSWORD=password
       - POSTGRES_USER=user
       - POSTGRES_DB=dbname
-    command: postgres -c max_connections=450 -c shared_buffers=32MB -c effective_cache_size=96MB -c work_mem=3MB -c maintenance_work_mem=12MB -c synchronous_commit=off -c fsync=off
+    command: postgres -c max_connections=250 -c shared_buffers=120MB -c effective_cache_size=300MB -c work_mem=4MB -c maintenance_work_mem=40MB -c synchronous_commit=off -c fsync=off -c wal_buffers=16MB -c checkpoint_completion_target=0.9 -c random_page_cost=1.1 -c log_statement=none -c log_duration=off -c autovacuum=off -c full_page_writes=off -c ssl=off -c effective_io_concurrency=300 -c min_wal_size=2GB -c max_wal_size=8GB -c commit_delay=10 -c commit_siblings=5
     networks:
       - backend
     healthcheck:
@@ -70,9 +64,21 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.35"
-          memory: "160MB"
+          cpus: "0.55"
+          memory: "200MB"
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: rinha-pgadmin
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=user@domain.com
+      - PGADMIN_DEFAULT_PASSWORD=password
+    ports:
+      - "5050:80"
+    networks:
+      - backend
 
 networks:
   backend:
     driver: bridge
+  payment-processor:
+    external: true

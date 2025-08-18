@@ -68,35 +68,40 @@ type PaymentTracker struct {
 	cacheMu       sync.RWMutex
 }
 
+// Add a deduplication cache to prevent race conditions
+type DeduplicationCache struct {
+	processedPayments map[string]bool
+	mu                sync.RWMutex
+}
+
 var (
 	defaultProcessorHealth  = &ProcessorHealth{}
 	fallbackProcessorHealth = &ProcessorHealth{}
 	paymentTracker          = &PaymentTracker{}
+	deduplicationCache      = &DeduplicationCache{processedPayments: make(map[string]bool)}
 	db                      *sql.DB
 
 	defaultProcessorURL  = "http://payment-processor-default:8080"
 	fallbackProcessorURL = "http://payment-processor-fallback:8080"
 
-	// Ultra-aggressive HTTP client for sub-10ms p99
+	// Ultra-fast HTTP client optimized for sub-10ms p99
 	httpClient = &http.Client{
-		Timeout: 800 * time.Millisecond, // Ultra-fast timeout for quick failures
+		Timeout: 300 * time.Millisecond, // More conservative timeout to reduce failures
 		Transport: &http.Transport{
-			MaxIdleConns:          1000,             // Maximum connection reuse
-			MaxIdleConnsPerHost:   200,              // High per-host connections
-			IdleConnTimeout:       30 * time.Second, // Quick cleanup
+			MaxIdleConns:          200,              // Reduced to prevent memory issues
+			MaxIdleConnsPerHost:   30,               // More focused connections
+			IdleConnTimeout:       10 * time.Second, // Longer to reuse connections
 			DisableKeepAlives:     false,
-			MaxConnsPerHost:       500, // Very high concurrency
-			TLSHandshakeTimeout:   500 * time.Millisecond,
-			ResponseHeaderTimeout: 300 * time.Millisecond,
+			MaxConnsPerHost:       50, // More conservative concurrency
+			TLSHandshakeTimeout:   100 * time.Millisecond,
+			ResponseHeaderTimeout: 100 * time.Millisecond,
+			DisableCompression:    true, // Reduce CPU overhead
+			WriteBufferSize:       4096, // Small buffer for speed
+			ReadBufferSize:        4096, // Small buffer for speed
 		},
 	}
 
-	// Batch processing for database writes
-	paymentBatch []PaymentRecord
-	batchMutex   sync.Mutex
-	batchTimer   *time.Timer
-
-	healthCheckInterval = 3 * time.Second
+	healthCheckInterval = 5 * time.Second
 )
 
 func main() {
@@ -126,11 +131,11 @@ func main() {
 	}
 	defer db.Close()
 
-	// Ultra-aggressive connection pool for sub-10ms performance
-	db.SetMaxOpenConns(150)                // Very high concurrency
-	db.SetMaxIdleConns(75)                 // High idle connections
-	db.SetConnMaxLifetime(5 * time.Minute) // Shorter lifetime for fresh connections
-	db.SetConnMaxIdleTime(1 * time.Minute) // Aggressive idle cleanup
+	// Optimized connection pool for speed and consistency
+	db.SetMaxOpenConns(30)                  // Further reduced to prevent lock contention
+	db.SetMaxIdleConns(15)                  // Fewer idle connections
+	db.SetConnMaxLifetime(90 * time.Second) // Shorter lifetime to prevent stale connections
+	db.SetConnMaxIdleTime(30 * time.Second) // Faster cleanup
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -140,21 +145,24 @@ func main() {
 
 	paymentTracker.db = db
 
-	// Ultra-fast batch processing for sub-10ms latency
-	paymentBatch = make([]PaymentRecord, 0, 100) // Much larger buffer
-
-	// Start ultra-high-frequency batch processing
-	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond) // Ultra-fast: every 10ms
-		defer ticker.Stop()
-		for range ticker.C {
-			processPendingBatch()
-		}
-	}()
-
 	if err := initDatabase(); err != nil {
 		log.Fatal("Failed to initialize database:", err)
 	}
+
+	// Start cache cleanup routine to prevent memory bloat
+	go func() {
+		ticker := time.NewTicker(10 * time.Second) // More frequent cleanup
+		defer ticker.Stop()
+		for range ticker.C {
+			deduplicationCache.mu.Lock()
+			// Clear cache more aggressively to prevent memory bloat and race conditions
+			if len(deduplicationCache.processedPayments) > 5000 {
+				deduplicationCache.processedPayments = make(map[string]bool)
+				log.Printf("Cleared deduplication cache (had %d entries)", len(deduplicationCache.processedPayments))
+			}
+			deduplicationCache.mu.Unlock()
+		}
+	}()
 
 	r := mux.NewRouter()
 	r.HandleFunc("/payments", handlePayments).Methods("POST")
@@ -168,10 +176,10 @@ func main() {
 	server := &http.Server{
 		Addr:           ":" + port,
 		Handler:        r,
-		ReadTimeout:    2 * time.Second,  // Ultra-fast response
-		WriteTimeout:   2 * time.Second,  // Ultra-fast response
-		IdleTimeout:    30 * time.Second, // Quick cleanup
-		MaxHeaderBytes: 1 << 14,          // Reduced to 16KB for max speed
+		ReadTimeout:    1 * time.Second,  // Ultra-fast response
+		WriteTimeout:   1 * time.Second,  // Ultra-fast response
+		IdleTimeout:    15 * time.Second, // Quick cleanup
+		MaxHeaderBytes: 1 << 12,          // 4KB for maximum speed
 	}
 
 	log.Fatal(server.ListenAndServe())
@@ -211,97 +219,22 @@ func initDatabase() error {
 	return nil
 }
 
-// Batch processing functions for better database performance
-func processPendingBatch() {
-	batchMutex.Lock()
-	if len(paymentBatch) == 0 {
-		batchMutex.Unlock()
-		return
-	}
-
-	batch := make([]PaymentRecord, len(paymentBatch))
-	copy(batch, paymentBatch)
-	paymentBatch = paymentBatch[:0] // Clear the batch
-	batchMutex.Unlock()
-
-	if len(batch) > 0 {
-		processBatch(batch)
-	}
-}
-
-func processBatch(batch []PaymentRecord) {
-	if len(batch) == 0 {
-		return
-	}
-
-	// Use a single transaction for the entire batch
-	tx, err := db.Begin()
-	if err != nil {
-		log.Printf("Failed to start transaction: %v", err)
-		return
-	}
-	defer tx.Rollback()
-
-	stmt, err := tx.Prepare(`INSERT INTO payments (correlation_id, amount, processor, created_at) 
-							VALUES ($1, $2, $3, $4) ON CONFLICT (correlation_id) DO NOTHING`)
-	if err != nil {
-		log.Printf("Failed to prepare batch statement: %v", err)
-		return
-	}
-	defer stmt.Close()
-
-	for _, payment := range batch {
-		_, err := stmt.Exec(payment.CorrelationID, payment.Amount, payment.Processor, payment.Timestamp)
-		if err != nil {
-			log.Printf("Failed to execute batch insert: %v", err)
-			continue
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		log.Printf("Failed to commit batch: %v", err)
-	}
-}
-
-func storePaymentAsync(payment PaymentRecord) {
-	batchMutex.Lock()
-	paymentBatch = append(paymentBatch, payment)
-	batchSize := len(paymentBatch)
-	batchMutex.Unlock()
-
-	// Process immediately if batch is full or timeout
-	if batchSize >= 50 { // Larger batches for efficiency
-		go processPendingBatch()
-	}
-}
-
-func storePayment(payment PaymentRecord) error {
-	query := `INSERT INTO payments (correlation_id, amount, processor, created_at) 
-			  VALUES ($1, $2, $3, $4) ON CONFLICT (correlation_id) DO NOTHING`
-
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	_, err := db.ExecContext(ctx, query, payment.CorrelationID, payment.Amount, payment.Processor, payment.Timestamp)
-	return err
-}
-
 func getPaymentsSummary() (*PaymentsSummary, error) {
-	// Use ultra-fast cached summary (cache for 100ms under high load)
+	// Use cache for only 10ms to ensure more accurate results under high load
 	paymentTracker.cacheMu.RLock()
-	if time.Since(paymentTracker.lastCacheTime) < 100*time.Millisecond && paymentTracker.lastSummary != nil {
+	if time.Since(paymentTracker.lastCacheTime) < 10*time.Millisecond && paymentTracker.lastSummary != nil {
 		summary := paymentTracker.lastSummary
 		paymentTracker.cacheMu.RUnlock()
 		return summary, nil
 	}
 	paymentTracker.cacheMu.RUnlock()
 
-	// Query database for summary
+	// Query database for summary with optimized timeout
 	query := `SELECT processor, COUNT(*) as total_requests, COALESCE(SUM(amount), 0) as total_amount 
 			  FROM payments 
 			  GROUP BY processor`
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second) // Longer timeout for reliability
 	defer cancel()
 
 	rows, err := db.QueryContext(ctx, query)
@@ -324,16 +257,17 @@ func getPaymentsSummary() (*PaymentsSummary, error) {
 			return nil, err
 		}
 
-		if processor == "default" {
+		switch processor {
+		case "default":
 			summary.Default.TotalRequests = totalRequests
 			summary.Default.TotalAmount = totalAmount
-		} else if processor == "fallback" {
+		case "fallback":
 			summary.Fallback.TotalRequests = totalRequests
 			summary.Fallback.TotalAmount = totalAmount
 		}
 	}
 
-	// Cache the result
+	// Cache the result for fast access
 	paymentTracker.cacheMu.Lock()
 	paymentTracker.lastSummary = summary
 	paymentTracker.lastCacheTime = time.Now()
@@ -390,70 +324,103 @@ func handlePayments(w http.ResponseWriter, r *http.Request) {
 }
 
 func processPayment(payment PaymentRequest) (*PaymentResponse, error) {
-	useDefault := shouldUseDefaultProcessor()
+	// Check for duplicate processing at application level first (fastest check)
+	deduplicationCache.mu.Lock()
+	if deduplicationCache.processedPayments[payment.CorrelationID] {
+		deduplicationCache.mu.Unlock()
+		return &PaymentResponse{Message: "Payment already processed"}, nil
+	}
+	// Mark as being processed immediately to prevent race conditions
+	deduplicationCache.processedPayments[payment.CorrelationID] = true
+	deduplicationCache.mu.Unlock()
 
-	var processorURL, processorName string
-	if useDefault {
-		processorURL = defaultProcessorURL
-		processorName = "default"
-	} else {
-		processorURL = fallbackProcessorURL
-		processorName = "fallback"
+	// Use a transaction to atomically check and insert to prevent race conditions
+	tx, err := db.Begin()
+	if err != nil {
+		deduplicationCache.mu.Lock()
+		delete(deduplicationCache.processedPayments, payment.CorrelationID)
+		deduplicationCache.mu.Unlock()
+		return nil, fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback() // Will be no-op if we commit
+
+	// Check if payment already exists within the transaction
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	var exists bool
+	checkQuery := `SELECT EXISTS(SELECT 1 FROM payments WHERE correlation_id = $1 FOR UPDATE)`
+	err = tx.QueryRowContext(ctx, checkQuery, payment.CorrelationID).Scan(&exists)
+	if err != nil {
+		deduplicationCache.mu.Lock()
+		delete(deduplicationCache.processedPayments, payment.CorrelationID)
+		deduplicationCache.mu.Unlock()
+		return nil, fmt.Errorf("failed to check payment existence: %v", err)
 	}
 
-	response, err := sendPaymentToProcessorWithRetry(processorURL, payment, 0) // No retries for speed
-	if err != nil {
-		// Fail fast - try alternative processor once only
-		if useDefault {
-			response, err = sendPaymentToProcessorWithRetry(fallbackProcessorURL, payment, 0)
-			if err != nil {
-				return nil, fmt.Errorf("both processors failed: %v", err)
-			}
+	if exists {
+		tx.Rollback()
+		return &PaymentResponse{Message: "Payment already processed"}, nil
+	}
+
+	useDefault := shouldUseDefaultProcessor()
+
+	var processorName string
+	var response *PaymentResponse
+
+	// Try primary processor first
+	if useDefault {
+		processorName = "default"
+		response, err = sendPaymentToProcessor(defaultProcessorURL, payment)
+
+		// If primary fails, try fallback ONCE
+		if err != nil {
 			processorName = "fallback"
-		} else {
-			response, err = sendPaymentToProcessorWithRetry(defaultProcessorURL, payment, 0)
-			if err != nil {
-				return nil, fmt.Errorf("both processors failed: %v", err)
-			}
+			response, err = sendPaymentToProcessor(fallbackProcessorURL, payment)
+		}
+	} else {
+		processorName = "fallback"
+		response, err = sendPaymentToProcessor(fallbackProcessorURL, payment)
+
+		// If primary fails, try fallback ONCE
+		if err != nil {
 			processorName = "default"
+			response, err = sendPaymentToProcessor(defaultProcessorURL, payment)
 		}
 	}
 
-	record := PaymentRecord{
-		CorrelationID: payment.CorrelationID,
-		Amount:        payment.Amount,
-		Processor:     processorName,
-		Timestamp:     time.Now(),
+	// If both processors failed, rollback and fail
+	if err != nil {
+		tx.Rollback()
+		deduplicationCache.mu.Lock()
+		delete(deduplicationCache.processedPayments, payment.CorrelationID)
+		deduplicationCache.mu.Unlock()
+		return nil, fmt.Errorf("both processors failed: %v", err)
 	}
 
-	// Store payment in database using batch processing for better performance
-	go storePaymentAsync(record)
+	// Insert payment within transaction to ensure atomicity
+	query := `INSERT INTO payments (correlation_id, amount, processor, created_at) 
+			  VALUES ($1, $2, $3, $4)`
+
+	_, dbErr := tx.ExecContext(ctx, query, payment.CorrelationID, payment.Amount, processorName, time.Now())
+	if dbErr != nil {
+		tx.Rollback()
+		deduplicationCache.mu.Lock()
+		delete(deduplicationCache.processedPayments, payment.CorrelationID)
+		deduplicationCache.mu.Unlock()
+		return nil, fmt.Errorf("failed to store payment: %v", dbErr)
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		deduplicationCache.mu.Lock()
+		delete(deduplicationCache.processedPayments, payment.CorrelationID)
+		deduplicationCache.mu.Unlock()
+		return nil, fmt.Errorf("failed to commit transaction: %v", err)
+	}
 
 	response.Message = "Payment processed successfully"
 	return response, nil
-}
-
-func sendPaymentToProcessorWithRetry(processorURL string, payment PaymentRequest, maxRetries int) (*PaymentResponse, error) {
-	var lastErr error
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt*50) * time.Millisecond) // Reduced from 100ms
-		}
-
-		response, err := sendPaymentToProcessor(processorURL, payment)
-		if err == nil {
-			return response, nil
-		}
-
-		lastErr = err
-		// Remove logging during high load to reduce overhead
-		if attempt == maxRetries {
-			log.Printf("Payment failed after %d attempts: %v", maxRetries+1, err)
-		}
-	}
-
-	return nil, lastErr
 }
 
 func sendPaymentToProcessor(processorURL string, payment PaymentRequest) (*PaymentResponse, error) {
@@ -468,7 +435,7 @@ func sendPaymentToProcessor(processorURL string, payment PaymentRequest) (*Payme
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 800*time.Millisecond) // Ultra-fast timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond) // Match client timeout
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, "POST", processorURL+"/payments", bytes.NewBuffer(paymentJSON))
