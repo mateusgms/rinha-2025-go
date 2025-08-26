@@ -82,10 +82,6 @@ curl -X POST http://localhost:9999/payments \
 **POST /payments** - Process payment with intelligent routing  
 **GET /payments-summary** - Retrieve processing statistics
 
-## 📈 Architecture Highlights
-
-This implementation focuses on achieving maximum performance while maintaining data consistency, specifically optimized for the Rinha de Backend 2025 competition requirements.
-
 ---
 
 **Built for Rinha de Backend 2025** - A competitive programming challenge focused on high-performance backend systems.
